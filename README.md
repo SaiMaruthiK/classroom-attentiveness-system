@@ -329,10 +329,3 @@ All settings are in `backend/config.py`:
 
 ---
 
-## 📄 License
-
-MIT License — free for academic and educational use.
-
----
-
-*Built with ❤️ using Python, OpenCV, YOLOv8, MediaPipe, FastAPI, and Streamlit.*
