@@ -1,7 +1,7 @@
 """
 =============================================================
 CLASSROOM STUDENT ATTENTIVENESS DETECTION SYSTEM
-Main Detection Pipeline
+Main Detection Pipeline — Cloud-connected version
 =============================================================
 Run:  python backend/main.py
 """
@@ -10,11 +10,13 @@ import time
 import logging
 import threading
 import queue
+import os
 from datetime import datetime
 from typing import Dict, Any, List
 
 import cv2
 import numpy as np
+import requests
 
 import backend.config as cfg
 from utils.helpers import setup_logging, FPSCounter, resize_frame, crop_face
@@ -32,10 +34,35 @@ from backend.database import db
 setup_logging(cfg.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
+# ── Cloud API URL ─────────────────────────────────────────
+# Set this to your Railway URL or leave blank to use local DB only
+CLOUD_API_URL = os.environ.get(
+    "CLOUD_API_URL",
+    "https://web-production-a77df.up.railway.app"
+)
+USE_CLOUD = bool(CLOUD_API_URL)
+
+
+def push_to_cloud(records: List[Dict]):
+    """Push attentiveness records to cloud API."""
+    if not USE_CLOUD:
+        return
+    try:
+        resp = requests.post(
+            f"{CLOUD_API_URL}/save_records",
+            json={"records": records},
+            timeout=3,
+        )
+        if resp.status_code != 200:
+            logger.debug("Cloud push status: %s", resp.status_code)
+    except Exception as e:
+        logger.debug("Cloud push failed: %s", e)
+
 
 class AttentivenessSystem:
     """
     Orchestrates the full detection → recognition → analysis → storage pipeline.
+    Saves to local DB and pushes to cloud API simultaneously.
     """
 
     def __init__(self):
@@ -72,9 +99,11 @@ class AttentivenessSystem:
         # ── State ──────────────────────────────────────────
         self.student_cache: Dict[int, Dict[str, Any]] = {}
         self.db_queue: queue.Queue = queue.Queue(maxsize=500)
+        self.cloud_queue: queue.Queue = queue.Queue(maxsize=500)
         self.fps_counter = FPSCounter()
         self._running = False
         self._db_thread = threading.Thread(target=self._db_writer, daemon=True)
+        self._cloud_thread = threading.Thread(target=self._cloud_writer, daemon=True)
 
     # ── DB Writer Thread ───────────────────────────────────
     def _db_writer(self):
@@ -93,12 +122,30 @@ class AttentivenessSystem:
                     db.bulk_save_records(batch)
                     batch.clear()
 
+    # ── Cloud Writer Thread ────────────────────────────────
+    def _cloud_writer(self):
+        batch: List[Dict] = []
+        last_flush = time.time()
+        while self._running or not self.cloud_queue.empty():
+            try:
+                record = self.cloud_queue.get(timeout=0.5)
+                # Convert datetime to string for JSON
+                r = dict(record)
+                if isinstance(r.get("timestamp"), datetime):
+                    r["timestamp"] = r["timestamp"].isoformat()
+                batch.append(r)
+                if len(batch) >= 10 or (time.time() - last_flush) >= 2.0:
+                    push_to_cloud(batch)
+                    batch.clear()
+                    last_flush = time.time()
+            except queue.Empty:
+                if batch:
+                    push_to_cloud(batch)
+                    batch.clear()
+
     # ── Per-Frame Processing ───────────────────────────────
     def process_frame(self, frame: np.ndarray, frame_idx: int) -> np.ndarray:
-        # 1. Detect faces
         detections = self.detector.detect(frame)
-
-        # 2. Track
         tracks = self.tracker.update(detections, frame)
 
         class_summary: Dict[str, int] = {"Attentive": 0, "Distracted": 0, "Sleeping": 0}
@@ -107,7 +154,6 @@ class AttentivenessSystem:
             tid, x1, y1, x2, y2 = track
             box = (x1, y1, x2, y2)
 
-            # 3. Recognize (cache to avoid every-frame inference)
             if tid not in self.student_cache:
                 sid, sname = self.recognizer.recognize(frame, box, tid)
                 self.student_cache[tid] = {"student_id": sid, "student_name": sname}
@@ -117,21 +163,12 @@ class AttentivenessSystem:
                 sname = self.student_cache[tid]["student_name"]
 
             face_crop = crop_face(frame, box)
-
-            # 4. Emotion
             emotion, _ = self.emotion_detector.detect(face_crop)
-
-            # 5. Head Pose
             head_pose_label, yaw, pitch, _ = self.head_pose.estimate(frame, box)
-
-            # 6. Blink / Eye State
-            eye_state, ear = self.blink_detector.detect(frame, box, tid)
-
-            # 7. Attention Score
+            eye_state, ear = self.blink_detector.detect(frame, box, int(tid))
             score = compute_attention_score(head_pose_label, eye_state, emotion)
             label = classify_attention(score)
 
-            # 8. Enqueue DB record
             now = datetime.utcnow()
             record = {
                 "student_id": sid,
@@ -144,12 +181,19 @@ class AttentivenessSystem:
                 "attention_label": label,
                 "timestamp": now,
             }
+
+            # Save locally
             try:
                 self.db_queue.put_nowait(record)
             except queue.Full:
                 pass
 
-            # 9. Draw
+            # Push to cloud
+            try:
+                self.cloud_queue.put_nowait(record)
+            except queue.Full:
+                pass
+
             student_info = {
                 "student_name": sname,
                 "attention_score": score,
@@ -161,7 +205,6 @@ class AttentivenessSystem:
             draw_student_overlay(frame, box, student_info)
             class_summary[label] = class_summary.get(label, 0) + 1
 
-        # Draw class HUD
         total = len(tracks)
         att = class_summary.get("Attentive", 0)
         summary = {
@@ -173,7 +216,6 @@ class AttentivenessSystem:
         }
         draw_class_hud(frame, summary)
 
-        # FPS
         fps = self.fps_counter.tick()
         cv2.putText(
             frame, f"FPS: {fps:.1f}",
@@ -198,6 +240,13 @@ class AttentivenessSystem:
 
         self._running = True
         self._db_thread.start()
+        self._cloud_thread.start()
+
+        if USE_CLOUD:
+            logger.info("Cloud sync enabled → %s", CLOUD_API_URL)
+        else:
+            logger.info("Cloud sync disabled — local DB only")
+
         logger.info("Detection pipeline started. Press 'q' to quit.")
 
         frame_idx = 0
@@ -205,13 +254,11 @@ class AttentivenessSystem:
             while True:
                 ret, frame = cap.read()
                 if not ret:
-                    logger.warning("Frame read failed. Retrying...")
                     time.sleep(0.05)
                     continue
 
                 frame = resize_frame(frame, cfg.FRAME_WIDTH, cfg.FRAME_HEIGHT)
 
-                # Frame skipping for performance
                 if frame_idx % cfg.FRAME_SKIP == 0:
                     frame = self.process_frame(frame, frame_idx)
 
@@ -234,7 +281,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Classroom Attentiveness System")
     parser.add_argument("--source", default=None,
-                        help="Video source: camera index (0) or file path or RTSP URL")
+                        help="Video source: camera index or file path")
     args = parser.parse_args()
 
     source = args.source

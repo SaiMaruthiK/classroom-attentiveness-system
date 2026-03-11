@@ -1,18 +1,20 @@
 """
-FastAPI REST Backend
-Endpoints:
-  GET /attention          → current snapshot
-  GET /class_attention    → class summary
-  GET /student/{id}       → student history
-  GET /history            → full recent history
-  GET /health             → health check
+=============================================================
+CLASSROOM STUDENT ATTENTIVENESS DETECTION SYSTEM
+FastAPI REST Backend — with /save_records endpoint
+=============================================================
 """
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import datetime, timezone
+import logging
 
 from backend.database import db
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Student Attentiveness API",
@@ -23,54 +25,98 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize DB on startup
+# ── On startup ─────────────────────────────────────────────
 @app.on_event("startup")
-def startup():
+async def startup_event():
     db.init_db()
+    logger.info("Database initialised.")
 
+
+# ── Models ─────────────────────────────────────────────────
+class AttentivenessRecord(BaseModel):
+    student_id: str
+    student_name: str
+    emotion: Optional[str] = "neutral"
+    eye_state: Optional[str] = "open"
+    head_pose: Optional[str] = "forward"
+    body_pose: Optional[str] = "upright"
+    attention_score: float
+    attention_label: str
+    timestamp: Optional[str] = None
+
+
+class RecordsBatch(BaseModel):
+    records: List[AttentivenessRecord]
+
+
+# ── Endpoints ──────────────────────────────────────────────
 
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "attentiveness-api"}
 
 
+@app.post("/save_records")
+def save_records(batch: RecordsBatch):
+    """Receive attentiveness records from the classroom detection PC."""
+    try:
+        rows = []
+        for r in batch.records:
+            rows.append({
+                "student_id": r.student_id,
+                "student_name": r.student_name,
+                "emotion": r.emotion,
+                "eye_state": r.eye_state,
+                "head_pose": r.head_pose,
+                "body_pose": r.body_pose,
+                "attention_score": r.attention_score,
+                "attention_label": r.attention_label,
+                "timestamp": datetime.fromisoformat(r.timestamp)
+                             if r.timestamp else datetime.now(timezone.utc),
+            })
+        db.bulk_save_records(rows)
+        return {"status": "saved", "count": len(rows)}
+    except Exception as e:
+        logger.error("Error saving records: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/attention")
-def get_attention(limit: int = Query(default=50, le=500)):
-    """Latest N attentiveness records."""
-    records = db.get_latest_records(limit=limit)
-    return {"count": len(records), "records": records}
+def get_attention(limit: int = 50):
+    """Get latest attentiveness records."""
+    try:
+        return db.get_latest_records(limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/class_attention")
 def get_class_attention():
-    """Aggregated class summary (last 30 seconds)."""
-    summary = db.get_current_attention_summary()
-    return summary
+    """Get aggregated class attention for last 30 seconds."""
+    try:
+        return db.get_class_summary(seconds=30)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/student/{student_id}")
-def get_student(student_id: str, minutes: int = Query(default=10, le=60)):
-    """History for a specific student."""
-    history = db.get_student_history(student_id, minutes=minutes)
-    if not history:
-        return {"student_id": student_id, "records": [], "message": "No data found"}
-
-    avg_score = sum(r["attention_score"] for r in history) / len(history)
-    return {
-        "student_id": student_id,
-        "student_name": history[0]["student_name"] if history else student_id,
-        "record_count": len(history),
-        "avg_attention_score": round(avg_score, 3),
-        "records": history,
-    }
+def get_student(student_id: str, minutes: int = 10):
+    """Get attention history for a specific student."""
+    try:
+        return db.get_student_history(student_id=student_id, minutes=minutes)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/history")
-def get_history(minutes: int = Query(default=10, le=60)):
-    """Class history over the last N minutes."""
-    records = db.get_class_history(minutes=minutes)
-    return {"minutes": minutes, "count": len(records), "records": records}
+def get_history(minutes: int = 10):
+    """Get full class history."""
+    try:
+        return db.get_history(minutes=minutes)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
