@@ -15,7 +15,7 @@ import plotly.graph_objects as go
 from datetime import datetime
 
 # ── Config ────────────────────────────────────────────────
-API_BASE = 
+API_BASE = "https://web-production-a77df.up.railway.app"
 REFRESH_RATE = 2  # seconds
 
 st.set_page_config(
